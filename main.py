@@ -1,67 +1,602 @@
 import argparse
-import sys, getopt, os
+import email.utils
+import os
+import sys
+import time
+import urllib.parse
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Set
+
+import requests
 import snyk
+from snyk.client import SnykClient
+from snyk.errors import SnykHTTPError
 from yaspin import yaspin
 
-parser = argparse.ArgumentParser(description='orgs: input the org(s) for which you would like to reactivate projects to generate webhooks.')
-parser.add_argument("--orgs")
-args = parser.parse_args()
-inputOrgs = args.orgs.split()
+TOKEN_ERROR_HINT = (
+    "Ran into an error while fetching account details; check your API token "
+    "or OAuth credentials and network access."
+)
 
-# Collect Snyk token if not in environment
-if "SNYK_TOKEN" in os.environ:
-    snyk_token = os.environ['SNYK_TOKEN']
-else:
-    print("Enter your Snyk API Token") 
-    snyk_token = input()
+# Mirrors `snyk config environment` regional URL mappings (see Snyk regional hosting docs).
+ENVIRONMENT_PRESETS: Dict[str, Dict[str, str]] = {
+    "SNYK-US-01": {
+        "api_url": "https://api.snyk.io/v1",
+        "rest_api_url": "https://api.snyk.io/rest",
+        "oauth_token_url": "https://api.snyk.io/oauth2/token",
+    },
+    "SNYK-US-02": {
+        "api_url": "https://api.us.snyk.io/v1",
+        "rest_api_url": "https://api.us.snyk.io/rest",
+        "oauth_token_url": "https://api.us.snyk.io/oauth2/token",
+    },
+    "SNYK-EU-01": {
+        "api_url": "https://api.eu.snyk.io/v1",
+        "rest_api_url": "https://api.eu.snyk.io/rest",
+        "oauth_token_url": "https://api.eu.snyk.io/oauth2/token",
+    },
+    "SNYK-AU-01": {
+        "api_url": "https://api.au.snyk.io/v1",
+        "rest_api_url": "https://api.au.snyk.io/rest",
+        "oauth_token_url": "https://api.au.snyk.io/oauth2/token",
+    },
+    "SNYK-GOV-01": {
+        "api_url": "https://api.snykgov.io/v1",
+        "rest_api_url": "https://api.snykgov.io/rest",
+        "oauth_token_url": "https://api.snykgov.io/oauth2/token",
+    },
+}
 
-# Set Snyk token, verify API token and get orgs
-userOrgs = []
-client = snyk.SnykClient(f'{snyk_token}')
-try:
-    userOrgs = client.organizations.all()
-except snyk.errors.SnykHTTPError as err:
-    print("💥 Ran into an error while fetching account details, please check your API token")
-    print( helpString)
 
-# Collect Orgs if not provided during script call
-if inputOrgs == '':
-    print("Input the org(s) for which you would like to reactivate projects to generate webhooks.")
-    inputOrgs = input().split()
+def _retry_after_seconds(retry_after: Optional[str]) -> float:
+    """Parse Retry-After (seconds or HTTP-date) into a sleep duration."""
+    if not retry_after:
+        return 60.0
+    value = retry_after.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        dt = None
+        if hasattr(email.utils, "parsedate_to_datetime"):
+            dt = email.utils.parsedate_to_datetime(value)  # Python 3.10+
+        if dt is None:
+            tup = email.utils.parsedate(value)
+            if tup:
+                dt = datetime(
+                    tup[0],
+                    tup[1],
+                    tup[2],
+                    tup[3],
+                    tup[4],
+                    tup[5],
+                    tzinfo=timezone.utc,
+                )
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            delta = (dt - datetime.now(timezone.utc)).total_seconds()
+            return max(0.1, float(delta))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return 60.0
 
-# Run through Orgs and deactivate projects
-for currOrg in userOrgs:
-    if currOrg.slug in inputOrgs:
-        #remove currorg for org proccesing list and print proccesing message
-        inputOrgs.remove(currOrg.slug)
-        print("Processing" + """ \033[1;32m"{}" """.format(currOrg.name) + "\u001b[0morganization")
 
-        #cycle through all projects in current org and deactivate
-        for currProject in currOrg.projects.all():
-            currProjectDetails = f"Origin: {currProject.origin}, Type: {currProject.type}"
-            action =  "Deactivating"
-            spinner = yaspin(text=f"{action}\033[1;33m {currProject.name}", color="yellow")
-            spinner.write(f"\u001b[0m    Processing project: \u001b[34m{currProjectDetails}\u001b[0m, Status Below👇")
+def _normalize_api_v1_url(url: str) -> str:
+    u = url.strip().rstrip("/")
+    if not u.endswith("/v1"):
+        u = f"{u}/v1"
+    return u
+
+
+def _oauth_token_url_from_api_v1(api_v1_url: str) -> str:
+    """https://api.example/v1 -> https://api.example/oauth2/token"""
+    base = api_v1_url.strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return f"{base}/oauth2/token"
+
+
+def _assert_trusted_snyk_https_url(url: str, what: str) -> str:
+    """
+    Restrict configurable endpoints to known Snyk hostnames over HTTPS so
+    user-supplied URLs cannot be abused for SSRF against internal networks.
+    Set SNYK_ALLOW_UNVERIFIED_API_URL=1 to skip hostname checks (single-tenant / nonstandard hosts).
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        raise SystemExit(f"{what} must use an https:// URL.")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise SystemExit(f"{what} must include a valid hostname.")
+
+    if os.environ.get("SNYK_ALLOW_UNVERIFIED_API_URL") == "1":
+        return url
+
+    if host.endswith(".snyk.io") or host.endswith(".snykgov.io"):
+        return url
+
+    raise SystemExit(
+        f"{what} hostname {host!r} is not under *.snyk.io or *.snykgov.io. "
+        "If your tenant uses another hostname, set SNYK_ALLOW_UNVERIFIED_API_URL=1 "
+        "(still requires HTTPS)."
+    )
+
+
+def _fetch_oauth_access_token(
+    token_url: str,
+    client_id: str,
+    client_secret: str,
+    *,
+    verify: bool = True,
+) -> Dict[str, Any]:
+    resp = requests.post(
+        token_url,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+        verify=verify,
+        timeout=120,
+    )
+    if not resp.ok:
+        raise SnykHTTPError(resp)
+    return resp.json()
+
+
+class RateLimitAwareSnykClient(snyk.SnykClient):
+    """
+    Extends pysnyk's client: retries on HTTP 429 using Retry-After, and sets
+    sensible defaults for transient 5xx retries (pysnyk only retries when
+    request() raises, which excludes 429).
+    """
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        rate_limit_max_attempts: int = 8,
+        **kwargs,
+    ):
+        kwargs.setdefault("tries", 5)
+        kwargs.setdefault("delay", 2)
+        kwargs.setdefault("backoff", 2)
+        super().__init__(token, **kwargs)
+        self.rate_limit_max_attempts = rate_limit_max_attempts
+
+    def request(
+        self,
+        method,
+        url: str,
+        headers: object,
+        params: object = None,
+        json: object = None,
+    ) -> requests.Response:
+        rate_limit_count = 0
+        while True:
+            if params and json:
+                resp = method(
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=json,
+                    verify=self.verify,
+                )
+            elif params and not json:
+                resp = method(
+                    url, headers=headers, params=params, verify=self.verify
+                )
+            elif json and not params:
+                resp = method(url, headers=headers, json=json, verify=self.verify)
+            else:
+                resp = method(url, headers=headers, verify=self.verify)
+
+            if resp.status_code == 429:
+                rate_limit_count += 1
+                if rate_limit_count > self.rate_limit_max_attempts:
+                    raise SnykHTTPError(resp)
+                wait = _retry_after_seconds(resp.headers.get("Retry-After"))
+                time.sleep(wait)
+                continue
+
+            if not resp or resp.status_code >= requests.codes.server_error:
+                raise SnykHTTPError(resp)
+            return resp
+
+
+class OAuthRateLimitAwareSnykClient(RateLimitAwareSnykClient):
+    """
+    Uses Authorization: Bearer <access_token> (required for OAuth2 service accounts).
+    pysnyk defaults to ``Authorization: token <api_key>``; OAuth access tokens need Bearer.
+
+    With client_id + client_secret, fetches and refreshes tokens via the OAuth2 token endpoint
+    before they expire (client_credentials grant).
+    """
+
+    _OAUTH_REFRESH_SKEW_SEC = 60.0
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        use_bearer: bool,
+        oauth_client_id: Optional[str] = None,
+        oauth_client_secret: Optional[str] = None,
+        oauth_token_url: Optional[str] = None,
+        **kwargs,
+    ):
+        self._use_bearer = use_bearer
+        self._oauth_client_id = oauth_client_id
+        self._oauth_client_secret = oauth_client_secret
+        self._oauth_token_url = oauth_token_url or ""
+        self._access_expires_at: float = 0.0
+        init_token = token
+        if use_bearer and oauth_client_id and oauth_client_secret and not (token or "").strip():
+            init_token = "oauth-pending"
+        super().__init__(init_token, **kwargs)
+        if self._use_bearer:
+            if self._oauth_client_credentials():
+                self._ensure_fresh_oauth_token()
+            else:
+                if not self.api_token.strip():
+                    raise SystemExit(
+                        "OAuth bearer mode requires SNYK_OAUTH_TOKEN or "
+                        "SNYK_OAUTH_CLIENT_ID and SNYK_OAUTH_CLIENT_SECRET."
+                    )
+                self._apply_bearer_headers()
+
+    def _apply_bearer_headers(self) -> None:
+        auth = f"Bearer {self.api_token}"
+        ua = self.api_headers.get("User-Agent", SnykClient.USER_AGENT)
+        self.api_headers = {"Authorization": auth, "User-Agent": ua}
+        self.api_post_headers = {
+            **self.api_headers,
+            "Content-Type": "application/json",
+        }
+
+    def _apply_api_key_headers(self) -> None:
+        auth = f"token {self.api_token}"
+        ua = self.api_headers.get("User-Agent", SnykClient.USER_AGENT)
+        self.api_headers = {"Authorization": auth, "User-Agent": ua}
+        self.api_post_headers = {
+            **self.api_headers,
+            "Content-Type": "application/json",
+        }
+
+    def _oauth_client_credentials(self) -> bool:
+        return bool(self._oauth_client_id and self._oauth_client_secret)
+
+    def _ensure_fresh_oauth_token(self) -> None:
+        if not self._oauth_client_credentials():
+            return
+        if self.api_token and self.api_token != "oauth-pending":
+            if time.monotonic() < self._access_expires_at - self._OAUTH_REFRESH_SKEW_SEC:
+                return
+        if not self._oauth_token_url:
+            raise SystemExit(
+                "OAuth client credentials are set but the token URL is missing. "
+                "Set SNYK_OAUTH_TOKEN_URL or use --environment / --oauth-token-url."
+            )
+        body = _fetch_oauth_access_token(
+            self._oauth_token_url,
+            self._oauth_client_id or "",
+            self._oauth_client_secret or "",
+            verify=self.verify,
+        )
+        access = body.get("access_token")
+        if not access or not isinstance(access, str):
+            raise SystemExit("OAuth token response did not include a usable access_token.")
+        self.api_token = access
+        expires_in = body.get("expires_in")
+        if expires_in is not None:
+            try:
+                self._access_expires_at = time.monotonic() + float(expires_in)
+            except (TypeError, ValueError):
+                self._access_expires_at = time.monotonic() + 3600.0
+        else:
+            self._access_expires_at = time.monotonic() + 3600.0
+        self._apply_bearer_headers()
+
+    def request(
+        self,
+        method,
+        url: str,
+        headers: object,
+        params: object = None,
+        json: object = None,
+    ) -> requests.Response:
+        if self._use_bearer:
+            self._ensure_fresh_oauth_token()
+        resp = super().request(method, url, headers, params, json)
+        if (
+            resp.status_code == 401
+            and self._oauth_client_credentials()
+            and self._use_bearer
+        ):
+            self._access_expires_at = 0.0
+            self._ensure_fresh_oauth_token()
+            resp = super().request(method, url, headers, params, json)
+        return resp
+
+
+def _parse_allowed_origins(args: argparse.Namespace) -> Optional[Set[str]]:
+    """
+    Build the set of project origins to include (Snyk project `origin` field).
+    --origin may be repeated; --origins adds more in one token group.
+    If none given, all origins are processed.
+    """
+    parts = []
+    if args.origin:
+        parts.extend(args.origin)
+    if args.origins:
+        parts.extend(args.origins)
+    if not parts:
+        return None
+    return {p.strip().casefold() for p in parts if p.strip()}
+
+
+def _should_process_project(origin: str, allowed: Optional[Set[str]]) -> bool:
+    if allowed is None:
+        return True
+    return origin.casefold() in allowed
+
+
+def _org_matches_token(org: Any, token: str) -> bool:
+    """True if token is this org's id (UUID) or slug (case-insensitive)."""
+    t = token.strip()
+    if org.id == t:
+        return True
+    return org.slug.casefold() == t.casefold()
+
+
+def _resolve_urls(args: argparse.Namespace) -> Dict[str, str]:
+    """API v1 base, REST base, and OAuth2 token URL for this run."""
+    env_name = (
+        getattr(args, "environment", None)
+        or os.environ.get("SNYK_ENVIRONMENT")
+        or "SNYK-US-01"
+    )
+    preset = ENVIRONMENT_PRESETS.get(env_name)
+    if not preset:
+        raise SystemExit(f"Unknown environment {env_name!r}; use one of the known presets.")
+
+    api = getattr(args, "api_url", None) or os.environ.get("SNYK_API_URL") or preset["api_url"]
+    api = _normalize_api_v1_url(api)
+
+    rest = (
+        getattr(args, "rest_api_url", None)
+        or os.environ.get("SNYK_REST_API_URL")
+        or preset["rest_api_url"]
+    ).rstrip("/")
+
+    oauth_token_url = (
+        getattr(args, "oauth_token_url", None)
+        or os.environ.get("SNYK_OAUTH_TOKEN_URL")
+        or preset.get("oauth_token_url")
+        or _oauth_token_url_from_api_v1(api)
+    )
+    _assert_trusted_snyk_https_url(api, "API v1 URL")
+    _assert_trusted_snyk_https_url(rest, "REST API URL")
+    _assert_trusted_snyk_https_url(oauth_token_url, "OAuth token URL")
+
+    return {
+        "environment": env_name,
+        "api_url": api,
+        "rest_api_url": rest,
+        "oauth_token_url": oauth_token_url,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Deactivate and reactivate Snyk projects to rebuild SCM webhooks. "
+            "Optionally limit to projects with specific Snyk project origins "
+            "(SCM / import source, e.g. github, gitlab)."
+        )
+    )
+    parser.add_argument(
+        "--orgs",
+        nargs="*",
+        default=None,
+        help=(
+            "Organization slug(s) and/or org id(s) (UUID from Snyk settings). "
+            "If omitted, you will be prompted."
+        ),
+    )
+    parser.add_argument(
+        "--origin",
+        action="append",
+        default=None,
+        metavar="ORIGIN",
+        help=(
+            "Only process projects with this Snyk project origin (repeat for "
+            "several). Examples: github, github-enterprise, gitlab, "
+            "bitbucket-cloud, azure-repos. Omit to include all origins."
+        ),
+    )
+    parser.add_argument(
+        "--origins",
+        nargs="+",
+        metavar="ORIGIN",
+        help=(
+            "Same as repeating --origin: only these project origins (space-separated)."
+        ),
+    )
+    parser.add_argument(
+        "--rate-limit-attempts",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Max consecutive HTTP 429 responses to retry per request (default: 8).",
+    )
+    parser.add_argument(
+        "--environment",
+        default=os.environ.get("SNYK_ENVIRONMENT"),
+        choices=sorted(ENVIRONMENT_PRESETS.keys()),
+        metavar="NAME",
+        help=(
+            "Snyk region/instance (same idea as `snyk config environment`). "
+            "Use SNYK-GOV-01 for Snyk for Government (FedRAMP). "
+            "Defaults to SNYK-US-01 when SNYK_ENVIRONMENT is unset."
+        ),
+    )
+    parser.add_argument(
+        "--api-url",
+        metavar="URL",
+        help=(
+            "Override API v1 base URL (e.g. https://api.snykgov.io/v1). "
+            "Also set via SNYK_API_URL."
+        ),
+    )
+    parser.add_argument(
+        "--rest-api-url",
+        metavar="URL",
+        help="Override REST API base URL. Also set via SNYK_REST_API_URL.",
+    )
+    parser.add_argument(
+        "--oauth-token-url",
+        metavar="URL",
+        help=(
+            "OAuth2 token endpoint (…/oauth2/token). Default is derived from the API URL. "
+            "Also set via SNYK_OAUTH_TOKEN_URL."
+        ),
+    )
+    args = parser.parse_args()
+
+    allowed_origins = _parse_allowed_origins(args)
+    input_orgs = list(args.orgs) if args.orgs else []
+
+    urls = _resolve_urls(args)
+    env_name = urls["environment"]
+
+    client_kw = {
+        "url": urls["api_url"],
+        "rest_api_url": urls["rest_api_url"],
+        "rate_limit_max_attempts": args.rate_limit_attempts,
+    }
+
+    oauth_client_id = os.environ.get("SNYK_OAUTH_CLIENT_ID")
+    oauth_client_secret = os.environ.get("SNYK_OAUTH_CLIENT_SECRET")
+    oauth_access = os.environ.get("SNYK_OAUTH_TOKEN")
+    api_key = os.environ.get("SNYK_TOKEN")
+
+    if oauth_client_id and oauth_client_secret:
+        client = OAuthRateLimitAwareSnykClient(
+            "",
+            use_bearer=True,
+            oauth_client_id=oauth_client_id,
+            oauth_client_secret=oauth_client_secret,
+            oauth_token_url=urls["oauth_token_url"],
+            **client_kw,
+        )
+    elif oauth_access:
+        client = OAuthRateLimitAwareSnykClient(
+            oauth_access,
+            use_bearer=True,
+            **client_kw,
+        )
+    elif api_key:
+        if env_name == "SNYK-GOV-01":
+            print(
+                "Snyk for Government (FedRAMP) does not support static API tokens; "
+                "use OAuth2 service account credentials (SNYK_OAUTH_CLIENT_ID and "
+                "SNYK_OAUTH_CLIENT_SECRET) or a short-lived SNYK_OAUTH_TOKEN.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        client = RateLimitAwareSnykClient(api_key, **client_kw)
+    else:
+        if env_name == "SNYK-GOV-01":
+            raise SystemExit(
+                "FedRAMP / Snyk for Government requires OAuth2. Set "
+                "SNYK_OAUTH_CLIENT_ID and SNYK_OAUTH_CLIENT_SECRET (recommended), or "
+                "SNYK_OAUTH_TOKEN for a short-lived access token. "
+                "Static SNYK_TOKEN is not allowed."
+            )
+        print("Enter your Snyk API Token")
+        snyk_token = input()
+        client = RateLimitAwareSnykClient(snyk_token, **client_kw)
+
+    user_orgs = []
+    try:
+        user_orgs = client.organizations.all()
+    except SnykHTTPError:
+        print(f"💥 {TOKEN_ERROR_HINT}")
+        raise SystemExit(1)
+
+    if not input_orgs:
+        print(
+            "Input the org slug(s) or org id(s) (UUID) for which you would like "
+            "to reactivate projects to generate webhooks."
+        )
+        input_orgs = input().split()
+
+    for curr_org in user_orgs:
+        matched = [t for t in input_orgs if _org_matches_token(curr_org, t)]
+        if not matched:
+            continue
+        for t in matched:
+            input_orgs.remove(t)
+        print(
+            "Processing"
+            + """ \033[1;32m"{}" """.format(curr_org.name)
+            + "\u001b[0morganization"
+        )
+
+        projects = [
+            p
+            for p in curr_org.projects.all()
+            if _should_process_project(p.origin, allowed_origins)
+        ]
+
+        for curr_project in projects:
+            curr_project_details = (
+                f"Origin: {curr_project.origin}, Type: {curr_project.type}"
+            )
+            action = "Deactivating"
+            spinner = yaspin(
+                text=f"{action}\033[1;33m {curr_project.name}", color="yellow"
+            )
+            spinner.write(
+                f"\u001b[0m    Processing project: \u001b[34m{curr_project_details}\u001b[0m, Status Below👇"
+            )
             spinner.start()
             try:
-                currProject.deactivate()
+                curr_project.deactivate()
                 spinner.ok("🆗 ")
-            except exception as e:
+            except Exception as err:
                 spinner.fail("💥 ")
+                spinner.write(f"\u001b[31m    {err}\u001b[0m")
 
-        #cycle through all projects in current org and activate     
-        for currProject in currOrg.projects.all():
-            currProjectDetails = f"Origin: {currProject.origin}, Type: {currProject.type}"
-            action =  "Activating"
-            spinner = yaspin(text=f"{action}\033[1;32m {currProject.name}", color="yellow")
-            spinner.write(f"\u001b[0m    Processing project: \u001b[34m{currProjectDetails}\u001b[0m, Status Below👇")
+        for curr_project in projects:
+            curr_project_details = (
+                f"Origin: {curr_project.origin}, Type: {curr_project.type}"
+            )
+            action = "Activating"
+            spinner = yaspin(
+                text=f"{action}\033[1;32m {curr_project.name}", color="yellow"
+            )
+            spinner.write(
+                f"\u001b[0m    Processing project: \u001b[34m{curr_project_details}\u001b[0m, Status Below👇"
+            )
             spinner.start()
             try:
-                currProject.activate()
+                curr_project.activate()
                 spinner.ok("🆗 ")
-            except exception as e:
+            except Exception as err:
                 spinner.fail("💥 ")
+                spinner.write(f"\u001b[31m    {err}\u001b[0m")
 
-#process input orgs which didnt have a match
-if len(inputOrgs) != 0:
-    print("\033[1;32m{}\u001b[0m are organizations which do not exist or you don't have access to them, please check your spelling, insure that spaces are replaced with dashes, and that you are using org slugs rather then display names".format(inputOrgs))
+    if input_orgs:
+        print(
+            "\033[1;32m{}\u001b[0m are organizations which do not exist or you "
+            "don't have access to them; check spelling, use dashes instead of "
+            "spaces, and use org slugs or org id (UUID) from Snyk.".format(
+                input_orgs
+            )
+        )
+
+
+if __name__ == "__main__":
+    main()
